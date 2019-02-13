@@ -1,0 +1,295 @@
+---
+title: "Analysis of Conversion Rate"
+author: "Xiaotian Zhan"
+date: "2018.12.29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+#--- needed packages
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(plotly)
+library(randomForest)
+library(pROC)
+library(ROCR)
+library(PRROC)
+library(ggplot2)
+```
+
+## Check Data
+
+### read data and show structure
+```{r read_data}
+PATH = "/home/billzhan/OneDrive/Academic/Open/Lai/take home challenge/conversion_rate"  #file path 
+FILENAME = "conversion_data.csv"  #file name
+FILE = file.path(PATH, FILENAME)
+data = read.csv(FILE)
+# data structure
+str(data)
+```
+  
+### inspect data and find weird examples
+```{r data_summary, echo=FALSE}
+summary(data)
+```
+A few quick observations:
+* the site is probably a US site, while it has a large Chinese user base.
+* user base is pretty young.
+* conversion rate is about 3%, which makes sense.
+* 'clicking search results' is the major source that makes users come to the site.
+* max age is 123, which doesn't make sense!
+```{r age_dist}
+sort(unique(data$age),decreasing = TRUE)
+```
+```{r age_subset}
+subset(data, age>79)
+data = subset(data, age<80)  #remove unusual entries
+```
+It is just 2 users! In this case, we can remove them, nothing will change. In general, depending on the problem, you can:
+* remove the entire row saying you don??t trust the data
+* treat those values as NAs
+* if there is a pattern, try to figure out what went wrong.
+In doubt, always go with removing the row. It is the safest choice.
+
+### investigate variables
+
+```{r groupby barplot - binary response}
+#--- general function
+groupby_barplot <- function(data, groupvar, response, chart_type = 'bar',
+                            title='Rate in different groups', colorstyle='Viridis'){
+  # Make barchart by pyplot, plot specific variable against the response variable, to see group distribution
+  # 
+  # Args:
+  #   data: the dataset to plot
+  #   groupvar: categorical variable name that is interested in
+  #   response: response variable name
+  #   title: title for the chart
+  #   colorstyle: different colorstyle for pyplot
+  # Returns:
+  #   a pyplot barchart object.
+  
+  groupvar = enquo(groupvar)  # enquo character to make it suitable in dplyr
+  response = enquo(response)
+  # process data
+  grouped_data = data %>%
+    group_by(!!groupvar) %>%  # !! to unpack variable name
+    summarise(rate = mean(!!response)) %>%
+    arrange(rate)
+  # plotly
+  p_groupby = plot_ly(
+  data = grouped_data,
+  x = groupvar,
+  y = ~rate,
+  name = title,
+  type = chart_type,
+  marker = list(color = grouped_data$rate,
+                colorscale = colorstyle),
+  width = 800
+  )
+  p_final <- layout(p_groupby, 
+                      xaxis = list(categoryarray = groupvar, categoryorder = "array")
+                      )
+}
+p = groupby_barplot(data, groupvar=country, response=converted)
+p
+```
+
+
+```{r groupby_country}
+data_country = data  %>%
+  group_by(country) %>%
+  summarise(conversion_rate = mean(converted)) %>%
+  arrange(conversion_rate)
+data_country$country = as.factor(data_country$country)
+p_country = plot_ly(
+  data = data_country,
+  x = ~country,
+  y = ~conversion_rate,
+  name = "Conversion Rate by Country",
+  type = "bar",
+  marker = list(color = data_country$conversion_rate,
+                colorscale = 'Viridis'),
+  width = 800
+)
+p_country <- layout(p_country, 
+                    xaxis = list(categoryarray = ~country, categoryorder = "array")
+                    )
+p_country
+```
+
+We can find that China has much lower conversion rate than other countries, which is really strange. There should be some problems in Chinese sites.
+
+```{r groupby_page}
+data_pages = data %>%
+  group_by(total_pages_visited) %>%
+  summarise(conversion_rate = mean(converted))
+p_page = plot_ly(data = data_pages,
+                 x = ~total_pages_visited,
+                 y = ~conversion_rate,
+                 type = 'scatter',
+                 mode = 'lines')
+p_page
+```
+Spending more time on the site means higher probability to convert. And 20 pages is a threshold. People will convert after visiting 20 pages.
+
+## Machine learning
+
+### Introduce model
+I am going to pick a random forest to predict conversion rate. I pick a random forest cause: it usually requires very little time to optimize it (its default params are often close to the best ones) and it is strong with outliers, irrelevant variables, continuous and discrete variables. I will use the random forest to predict conversion, then I will use its partial dependence plots and variable importance to get insights about how it got information from the variables.
+
+### Build RF
+``` {r prepare_data}
+data$converted = as.factor(data$converted) # let's make the class a factor
+data$new_user = as.factor(data$new_user) #also this a factor
+levels(data$country)[levels(data$country)=="Germany"]="DE" # Shorter name, easier to plot.
+```
+
+```{r split data}
+#--- general function
+split_tvt <- function(data,p,outcome){
+  # data    - dataset to split into train, validation, test
+  # p       - a vector of length 3, the proportions of train, val, test
+  # outcome - outcome variable name
+  require(caret)
+  # first split: test and no test
+  p_train_and_val = p[1]+p[2]
+  no_test_idx = createDataPartition(as.matrix(data[,outcome]), p=p_train_and_val, list=FALSE)
+  train_and_val = data[no_test_idx,]
+  test = data[-no_test_idx,]
+  # second split: train and val
+  p_train = p[1]/(p[1]+p[2])
+  train_idx = createDataPartition(as.matrix(train_and_val[,outcome]), p=p_train, list=FALSE)
+  train = train_and_val[train_idx,]
+  val = train_and_val[-train_idx,]
+  # results
+  splitted_data = list(train,val,test)
+  return(splitted_data)
+}
+splitted = split_tvt(data=data, c(0.7,0.15,0.15), outcome='converted')
+train = splitted[[1]];val = splitted[[2]];test = splitted[[3]]
+
+#--- this sample
+train_sample = sample(nrow(data), size = nrow(data)*0.66)
+train_data = data[train_sample,]
+test_data = data[-train_sample,]
+```
+
+```{r train rf}
+rf = randomForest(y=train_data$converted, x = train_data[, -ncol(train_data)],
+ytest = test_data$converted, xtest = test_data[, -ncol(test_data)],
+ntree = 100, mtry = 3, keep.forest = TRUE)
+rf
+# use rf$classes to see class orders
+# and then use rf$forest$cutoff to see cutoffs for different classes
+```
+OOB error and test error are pretty similar: 1.5% and 1.4%. We are confident we are not overfitting.However, we started from a 97% accuracy (that’s the case if we classified everything
+as “non converted”). So, 98.5% is good, but nothing shocking. Indeed, 30% of conversions are predicted as "non conversion".
+
+### ROC Evaluation
+```{r roc}
+pred_prob = predict(rf,test_data,type = 'prob')  #prob predict, the first col is neg, second col is pos
+# pred_ROCR = prediction(pred_prob[,2],test_data$converted)  #ROCR package
+# perform = performance(pred_ROCR,'tpr','fpr')  #ROCR
+pred_roc = roc(test_data$converted,pred_prob[,2])  #ROC object
+# ordinary plot, can show best threshold
+plot(pred_roc, xlim=c(1,0),print.thres= "best", print.thres.best.method="closest.topleft")
+
+# ggplot way
+g = ggroc(pred_roc,legacy.axes = TRUE)
+g
+```
+
+### Tune cutoff based on ROC
+```{r cutoff}
+rf_newcutoff = randomForest(y=train_data$converted, x = train_data[, -ncol(train_data)],
+ytest = test_data$converted, xtest = test_data[, -ncol(test_data)],
+ntree = 100, mtry = 3, keep.forest = TRUE, cutoff = c(0.995,0.005))
+rf_newcutoff
+```
+It's much better if we modify cutoff based on ROC! Even though the error rates of train and test sets rised, our new model significantly improved its performance on positive samples.
+
+### precision and recall
+```{r pr}
+probs = pred_prob[,2]  #second col is the prediction of postive
+fg = probs[test_data$converted==1]  #the probability of actually positive
+bg = probs[test_data$converted==0]  #the probability of actually negative
+# ROC Curve    
+roc <- roc.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+plot(roc)
+
+# PR Curve
+pr <- pr.curve(scores.class0 = fg, scores.class1 = bg, curve = T)
+curve_mat = pr$curve  #col1 recall,col2 precision, col3 threshold
+plot(pr)
+```
+As shown in the plot, we could get comprisingly good precision and recall at setting th=0.6 approximately. By referring to the table, we see that it is `r curve_mat[1312,]`.
+
+### Analyze RF
+```{r var importance}
+varImpPlot(rf,type=2)
+```
+We see that __Total pages visited__ is the most important one. Unfortunately, it is probable the least actionable. Because people who already want to buy visit more pages. We may need to drop this out of our model to see the var importance again.
+```{r}
+rf_wo_pages = randomForest(y=train_data$converted, x = train_data[, -c(5, ncol(train_data))],
+ytest = test_data$converted, xtest = test_data[, -c(5, ncol(train_data))],
+ntree = 100, mtry = 3, keep.forest = TRUE, classwt = c(0.7,0.3))
+rf_wo_pages
+```
+We need to change class weight since we lose a very powerful variable. We can lower the ratio (30:1 -> 2:1), but shouldn't turn the situation around(0>1 -> 0<1).
+
+```{r evaluate roc}
+pred_pages_prob = predict(rf_wo_pages,test_data,type = 'prob')  #prob predict, the first col is neg, second col is pos
+pred_pages_roc = roc(test_data$converted,pred_pages_prob[,2])  #ROC object
+# ordinary plot, can show best threshold
+plot(pred_pages_roc, xlim=c(1,0),print.thres= "best", print.thres.best.method="closest.topleft")
+```
+We see that under this situation, to get the best compromise result, we can set a threshold=0.005 for positive.
+```{r recheck varimp}
+varImpPlot(rf_wo_pages, type=2)
+```
+__New user__ is the most important one now!
+
+### Partial dependence plots
+```{r partial depend}
+op <- par(mfrow=c(2, 2))
+partialPlot(rf_wo_pages, train_data, country, 1)  #1 means pos here
+partialPlot(rf_wo_pages, train_data, age, 1)
+partialPlot(rf_wo_pages, train_data, new_user, 1)
+partialPlot(rf_wo_pages, train_data, source, 1)
+```
+In the partial dependence plots, we just care about the trend, not the actual y value. It shows that:(ranked by importance)
+* Old users have much better performance than new ones
+* China is really bad, and the other three country perform similar, with German the being the best.
+* The site works very well for young people and bad for less young(older than 30).
+* Source is almost irrelevant.
+
+### Build a DT to check the 2 or 3 most important segments
+```{r DT}
+tree = rpart(data$converted ~ ., data[, -c(5,ncol(data))],
+control = rpart.control(maxdepth = 10),
+parms = list(prior = c(0.7, 0.3))
+)
+rpart.plot(tree, box.palette="RdBu", shadow.col="gray", nn=TRUE)  #plot tree
+```
+A simple small tree confirms exactly the random forest findings.
+
+## Some conclusions and suggestions:
+1. The site is working very well for young users. Definitely let’s tell marketing to advertise and use marketing channel which are more likely to reach young people.
+2. The site is working very well for Germany in terms of conversion. But the summary showed that
+there are few Germans coming to the site: way less than UK, despite a larger population. Again,
+marketing should get more Germans. Big opportunity.
+3. Users with old accounts do much better. Targeted emails with offers to bring them back to the site could be a good idea to try.
+4. Something is wrong with the Chinese version of the site. It is either poorly translated, doesn’t fit the local culture, some payment issue or maybe it is just in English! Given how many users are based in China, fixing this should be a top priority. Huge opportunity.
+5. Maybe go through the UI and figure out why older users perform so poorly? From 30 y/o conversion clearly starts dropping.
+6. If I know someone has visited many pages, but hasn’t converted, she almost surely has high
+purchase intent. I could email her targeted offers or sending her reminders. Overall, these are
+probably the easiest users to make convert.
+
+
+As you can see, conclusions usually end up being about:
+
+1. tell marketing to get more of the good performing user segments
+2. tell product to fix the experience for the bad performing ones
